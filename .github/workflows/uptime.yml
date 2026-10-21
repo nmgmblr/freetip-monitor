@@ -1,0 +1,163 @@
+name: Uptime and ops check
+
+on:
+  schedule:
+    # Offset from the top of the hour to avoid the scheduler's busiest slots.
+    - cron: '7,22,37,52 * * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      health_url:
+        description: 'Optional health URL override for testing'
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check freetip.me health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # The URL is a repository secret, not a variable, so the monitor
+      # endpoint is not published in this public repository.
+      HEALTH_URL: ${{ github.event.inputs.health_url || secrets.UPTIME_HEALTH_URL }}
+    steps:
+      - name: Probe health
+        id: probe
+        shell: bash
+        env:
+          BODY_PATH: ${{ runner.temp }}/freetip-health.json
+          HEADERS_PATH: ${{ runner.temp }}/freetip-health.headers
+        run: |
+          set -u
+          code=""
+          for attempt in 1 2 3; do
+            code=$(curl -sS -L --max-time 15 \
+              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
+              -H 'cache-control: no-cache' \
+              -D "$HEADERS_PATH" -o "$BODY_PATH" -w '%{http_code}' \
+              "$HEALTH_URL" || true)
+            echo "attempt=$attempt status=$code"
+            if [ "$code" = "200" ]; then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+          echo "status=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Check health and manage incident issue
+        uses: actions/github-script@v7
+        env:
+          PROBE_STATUS: ${{ steps.probe.outputs.status }}
+          BODY_PATH: ${{ runner.temp }}/freetip-health.json
+          HEADERS_PATH: ${{ runner.temp }}/freetip-health.headers
+        with:
+          script: |
+            const fs = require('fs');
+            const title = '[Uptime] freetip.me health check failing';
+            const status = Number(process.env.PROBE_STATUS || 0);
+            let text = '';
+            let body = null;
+            let headerSummary = '';
+
+            try {
+              text = fs.readFileSync(process.env.BODY_PATH, 'utf8');
+              body = JSON.parse(text);
+            } catch {
+              body = null;
+            }
+
+            try {
+              headerSummary = fs.readFileSync(process.env.HEADERS_PATH, 'utf8')
+                .split(/\r?\n/)
+                .filter((line) => /^(cf-mitigated|cf-ray|server|content-type):/i.test(line))
+                .join('\n') || 'unavailable';
+            } catch {
+              headerSummary = 'unavailable';
+            }
+
+            const checks = body?.checks || {};
+            const ok =
+              status === 200 &&
+              body?.status === 'ok' &&
+              checks.db === 'ok' &&
+              checks.maintenance === 'ok' &&
+              checks.backup === 'ok';
+
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const checkedAt = new Date().toISOString();
+
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              ...context.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const incidents = openIssues.filter(
+              (issue) => !issue.pull_request && issue.title === title
+            );
+
+            if (!ok) {
+              const preview = text && !body ? text.replace(/\s+/g, ' ').slice(0, 500) : '';
+              const detail = [
+                'Automated FreeTip uptime/ops check failed.',
+                '',
+                `- HTTP: ${status || 'no response'}`,
+                `- status: ${body?.status ?? 'unparseable'}`,
+                `- db: ${checks.db ?? 'unknown'}`,
+                `- maintenance: ${checks.maintenance ?? 'unknown'}`,
+                `- backup: ${checks.backup ?? 'unknown'}`,
+                `- headers: ${headerSummary || 'unavailable'}`,
+                `- body: ${preview || 'unavailable'}`,
+                `- checked_at: ${checkedAt}`,
+                `- run: ${runUrl}`,
+              ].join('\n');
+
+              if (incidents.length === 0) {
+                const created = await github.rest.issues.create({
+                  ...context.repo,
+                  title,
+                  body: detail,
+                });
+                core.warning(`Opened incident #${created.data.number}`);
+              } else {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: incidents[0].number,
+                  body: detail,
+                });
+                core.warning(`Health check still failing; incident #${incidents[0].number} is open`);
+              }
+
+              core.setFailed(`Health check failed (HTTP ${status || 'no response'})`);
+              return;
+            }
+
+            core.info('Health check passed');
+            for (const issue of incidents) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: [
+                  'Health check recovered.',
+                  '',
+                  `- checked_at: ${checkedAt}`,
+                  `- run: ${runUrl}`,
+                ].join('\n'),
+              });
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+              core.info(`Closed incident #${issue.number}`);
+            }
